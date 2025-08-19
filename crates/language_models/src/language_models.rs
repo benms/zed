@@ -18,6 +18,7 @@ pub mod ui;
 use crate::provider::anthropic::AnthropicLanguageModelProvider;
 use crate::provider::bedrock::BedrockLanguageModelProvider;
 use crate::provider::cloud::{self, CloudLanguageModelProvider};
+use crate::provider::chutes::ChutesLanguageModelProvider;
 use crate::provider::copilot_chat::CopilotChatLanguageModelProvider;
 use crate::provider::google::GoogleLanguageModelProvider;
 use crate::provider::lmstudio::LmStudioLanguageModelProvider;
@@ -155,6 +156,10 @@ fn register_language_model_providers(
     );
     registry.register_provider(
         BedrockLanguageModelProvider::new(client.http_client(), cx),
+        cx,
+    );
+    registry.register_provider(
+        ChutesLanguageModelProvider::new(client.http_client(), cx),
         cx,
     );
     registry.register_provider(
