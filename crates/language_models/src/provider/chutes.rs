@@ -1,5 +1,4 @@
 use anyhow::{Context as _, Result, anyhow};
-use collections::{BTreeMap, HashMap};
 use credentials_provider::CredentialsProvider;
 
 use futures::Stream;
@@ -7,23 +6,20 @@ use futures::{FutureExt, StreamExt, future::BoxFuture};
 use gpui::{AnyView, App, AsyncApp, Context, Entity, Subscription, Task, Window};
 use http_client::HttpClient;
 use language_model::{
-    AuthenticateError, LanguageModel, LanguageModelCompletionError, LanguageModelCompletionEvent,
+    AuthenticateError, LanguageModel, LanguageModelCompletionEvent, LanguageModelCompletionError,
     LanguageModelId, LanguageModelName, LanguageModelProvider, LanguageModelProviderId,
     LanguageModelProviderName, LanguageModelProviderState, LanguageModelRequest,
-    LanguageModelToolChoice, LanguageModelToolResultContent, LanguageModelToolUse, MessageContent,
-    RateLimiter, Role, StopReason, TokenUsage,
+    MessageContent, RateLimiter, Role, StopReason, TokenUsage,
 };
-use menu;
-use chutes::{Model, stream_completion, complete};
+use chutes::{Model, stream_completion};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use settings::{Settings, SettingsStore};
 use std::pin::Pin;
-use std::str::FromStr as _;
 use std::sync::Arc;
 use strum::IntoEnumIterator;
 
-use ui::{ElevationIndex, List, Tooltip, prelude::*};
+use ui::{List, ListItem, ListSeparator, prelude::*};
 use ui_input::SingleLineInput;
 use util::ResultExt;
 
@@ -162,7 +158,7 @@ impl LanguageModelProvider for ChutesLanguageModelProvider {
     }
 
     fn icon(&self) -> ui::IconName {
-        ui::IconName::AiAssistant
+        ui::IconName::ZedAssistant
     }
 
     fn provided_models(&self, cx: &App) -> Vec<Arc<dyn LanguageModel>> {
@@ -175,7 +171,7 @@ impl LanguageModelProvider for ChutesLanguageModelProvider {
             }
 
             models.push(Arc::new(ChutesLanguageModel {
-                id: LanguageModelId::from(format!("chutes::{}", model.id()).as_str()),
+                id: LanguageModelId::from(format!("chutes::{}", model.id())),
                 model,
                 http_client: self.http_client.clone(),
                 request_limiter: RateLimiter::new(4),
@@ -187,7 +183,7 @@ impl LanguageModelProvider for ChutesLanguageModelProvider {
         if let Some(chutes_settings) = AllLanguageModelSettings::get_global(cx).chutes.as_ref() {
             for model in &chutes_settings.available_models {
                 models.push(Arc::new(ChutesLanguageModel {
-                    id: LanguageModelId::from(format!("chutes::{}", model.name).as_str()),
+                    id: LanguageModelId::from(format!("chutes::{}", model.name)),
                     model: Model::Custom {
                         name: model.name.clone(),
                         display_name: model.display_name.clone(),
@@ -212,12 +208,9 @@ impl LanguageModelProvider for ChutesLanguageModelProvider {
         self.state.update(cx, |state, cx| state.authenticate(cx))
     }
 
-    fn configuration_view(&self, cx: &mut Window) -> AnyView {
-        cx.new(|cx| ConfigurationView {
-            api_key: String::new(),
-            state: self.state.clone(),
-        })
-        .into()
+    fn configuration_view(&self, _agent: language_model::ConfigurationViewTargetAgent, window: &mut Window, cx: &mut App) -> AnyView {
+        cx.new(|cx| ConfigurationView::new(self.state.clone(), window, cx))
+            .into()
     }
 
     fn reset_credentials(&self, cx: &mut App) -> Task<anyhow::Result<()>> {
@@ -230,12 +223,20 @@ impl LanguageModelProvider for ChutesLanguageModelProvider {
             .find(|model| model.name().0.contains("llama-3.1-405b"))
     }
 
-    fn provider_state(&self, cx: &App) -> LanguageModelProviderState {
-        if self.is_authenticated(cx) {
-            LanguageModelProviderState::Authenticated
-        } else {
-            LanguageModelProviderState::NotAuthenticated
-        }
+    fn default_fast_model(&self, cx: &App) -> Option<Arc<dyn LanguageModel>> {
+        self.provided_models(cx)
+            .into_iter()
+            .find(|model| model.name().0.contains("llama-3.1-70b"))
+            .or_else(|| self.provided_models(cx).into_iter().next())
+    }
+
+}
+
+impl LanguageModelProviderState for ChutesLanguageModelProvider {
+    type ObservableEntity = State;
+
+    fn observable_entity(&self) -> Option<gpui::Entity<Self::ObservableEntity>> {
+        Some(self.state.clone())
     }
 }
 
@@ -248,18 +249,42 @@ pub struct ChutesLanguageModel {
 }
 
 impl ChutesLanguageModel {
-    fn to_chutes_message(message: &language_model::Message) -> chutes::Message {
+    fn to_chutes_message(message: &language_model::LanguageModelRequestMessage) -> chutes::Message {
+        let mut content_text = String::new();
+        
+        for content in &message.content {
+            match content {
+                MessageContent::Text(text) => {
+                    if !content_text.is_empty() {
+                        content_text.push('\n');
+                    }
+                    content_text.push_str(text);
+                }
+                MessageContent::Image(_image_data) => {
+                    if !content_text.is_empty() {
+                        content_text.push('\n');
+                    }
+                    content_text.push_str("[Image content]");
+                }
+                _ => {
+                    // Handle other content types (thinking, tool use, etc.)
+                    if let Some(str_content) = content.to_str() {
+                        if !content_text.is_empty() {
+                            content_text.push('\n');
+                        }
+                        content_text.push_str(str_content);
+                    }
+                }
+            }
+        }
+        
         chutes::Message {
             role: match message.role {
                 Role::User => chutes::Role::User,
                 Role::Assistant => chutes::Role::Assistant,
                 Role::System => chutes::Role::System,
-                Role::Tool => chutes::Role::Tool,
             },
-            content: match &message.content {
-                MessageContent::Text(text) => text.clone(),
-                MessageContent::Image { text, .. } => text.clone(),
-            },
+            content: content_text,
         }
     }
 }
@@ -270,7 +295,7 @@ impl LanguageModel for ChutesLanguageModel {
     }
 
     fn name(&self) -> LanguageModelName {
-        LanguageModelName::from(self.model.display_name())
+        LanguageModelName::from(self.model.display_name().to_string())
     }
 
     fn provider_id(&self) -> LanguageModelProviderId {
@@ -291,16 +316,21 @@ impl LanguageModel for ChutesLanguageModel {
 
     fn count_tokens(
         &self,
-        request: &LanguageModelRequest,
-        cx: &App,
+        request: LanguageModelRequest,
+        _cx: &App,
     ) -> BoxFuture<'static, Result<u64>> {
         // Simple token estimation - in a real implementation you'd use tiktoken or similar
         let text = request
             .messages
             .iter()
-            .map(|msg| match &msg.content {
-                MessageContent::Text(text) => text.len(),
-                MessageContent::Image { text, .. } => text.len() + 100, // Add for image
+            .map(|msg| {
+                msg.content.iter().map(|content| {
+                    match content {
+                        MessageContent::Text(text) => text.len(),
+                        MessageContent::Image(_) => 100, // Estimate for image
+                        _ => content.to_str().map_or(0, |s| s.len()),
+                    }
+                }).sum::<usize>()
             })
             .sum::<usize>() as u64;
         
@@ -311,15 +341,18 @@ impl LanguageModel for ChutesLanguageModel {
         &self,
         request: LanguageModelRequest,
         cx: &AsyncApp,
-    ) -> BoxFuture<'static, Result<Pin<Box<dyn Stream<Item = Result<LanguageModelCompletionEvent>> + Send + 'static>>>> {
+    ) -> BoxFuture<'static, Result<Pin<Box<dyn Stream<Item = Result<LanguageModelCompletionEvent, LanguageModelCompletionError>> + Send + 'static>>, LanguageModelCompletionError>> {
         let http_client = self.http_client.clone();
         let state = self.state.clone();
         let model = self.model.clone();
         let request_limiter = self.request_limiter.clone();
 
+        let api_key_result = state.read_with(cx, |state, _cx| state.api_key.clone());
+        
         async move {
-            let api_key = state.update(cx, |state, _cx| state.api_key.clone())?
-                .ok_or_else(|| anyhow!("missing API key"))?;
+            let api_key = api_key_result
+                .map_err(|e| LanguageModelCompletionError::Other(e))?
+                .ok_or_else(|| LanguageModelCompletionError::Other(anyhow!("missing API key")))?;
 
             let chutes_request = chutes::Request {
                 model: model.id().to_string(),
@@ -328,12 +361,12 @@ impl LanguageModel for ChutesLanguageModel {
                     .iter()
                     .map(Self::to_chutes_message)
                     .collect(),
-                max_tokens: request.max_tokens,
+                max_tokens: Some(4096), // Default max tokens since field doesn't exist
                 temperature: request.temperature,
                 stream: true,
             };
 
-            request_limiter.stream_request(async move {
+            let future = request_limiter.stream(async move {
                 let stream = stream_completion(
                     http_client.as_ref(),
                     chutes::CHUTES_API_URL,
@@ -365,32 +398,63 @@ impl LanguageModel for ChutesLanguageModel {
                                     return Ok(LanguageModelCompletionEvent::UsageUpdate(TokenUsage {
                                         input_tokens: usage.prompt_tokens,
                                         output_tokens: usage.completion_tokens,
-                                        cache_creation_input_tokens: None,
-                                        cache_read_input_tokens: None,
+                                        cache_creation_input_tokens: 0,
+                                        cache_read_input_tokens: 0,
                                     }));
                                 }
                                 Ok(LanguageModelCompletionEvent::Text(String::new()))
                             }
-                            Err(error) => Err(anyhow!(error)),
+                            Err(error) => Err(LanguageModelCompletionError::Other(anyhow!(error))),
                         }
                     })
                     .boxed())
-            }).await
+            });
+            Ok(future.await?.boxed())
         }.boxed()
     }
 
-    fn supports_structured_output(&self) -> bool {
+    fn supports_tools(&self) -> bool {
         false
     }
 
-    fn supports_tool_use(&self) -> bool {
+    fn supports_images(&self) -> bool {
+        true
+    }
+
+    fn supports_tool_choice(&self, _tool_choice: language_model::LanguageModelToolChoice) -> bool {
         false
     }
 }
 
 struct ConfigurationView {
-    api_key: String,
+    api_key_editor: Entity<SingleLineInput>,
     state: Entity<State>,
+}
+
+impl ConfigurationView {
+    fn new(state: Entity<State>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let api_key_editor = cx.new(|cx| {
+            SingleLineInput::new(
+                window,
+                cx,
+                "Enter your Chutes.ai API key",
+            )
+        });
+
+        Self {
+            api_key_editor,
+            state,
+        }
+    }
+
+    fn save_api_key(&mut self, cx: &mut Context<Self>) {
+        let api_key = self.api_key_editor.read(cx).text(cx);
+        if !api_key.trim().is_empty() {
+            self.state.update(cx, |state, cx| {
+                state.set_api_key(api_key.trim().to_string(), cx).detach_and_log_err(cx);
+            });
+        }
+    }
 }
 
 impl ui::Render for ConfigurationView {
@@ -412,7 +476,7 @@ impl ui::Render for ConfigurationView {
                                 v_flex()
                                     .gap_1()
                                     .children(INSTRUCTIONS.iter().map(|instruction| {
-                                        InstructionListItem::new(instruction)
+                                        InstructionListItem::new(*instruction, None::<String>, None::<String>)
                                     })),
                             ),
                     )
@@ -425,20 +489,7 @@ impl ui::Render for ConfigurationView {
                                 h_flex()
                                     .w_full()
                                     .justify_end()
-                                    .child(
-                                        SingleLineInput::new(&mut self.api_key)
-                                            .placeholder("Enter your Chutes.ai API key")
-                                            .password(true)
-                                            .on_input(cx.listener(|this, _, cx| {
-                                                cx.notify();
-                                            }))
-                                            .on_confirm(cx.listener(|this, _, cx| {
-                                                if !this.api_key.trim().is_empty() {
-                                                    this.save_api_key(cx);
-                                                }
-                                            }))
-                                            .w(px(200.0)),
-                                    ),
+                                    .child(self.api_key_editor.clone()),
                             ),
                     )
                     .child(ListSeparator)
@@ -448,9 +499,8 @@ impl ui::Render for ConfigurationView {
                             .child(
                                 Button::new("save", "Save API Key")
                                     .style(ButtonStyle::Filled)
-                                    .size(ButtonSize::Small)
-                                    .disabled(self.api_key.trim().is_empty())
-                                    .on_click(cx.listener(|this, _, cx| {
+                                    .size(ButtonSize::Compact)
+                                    .on_click(cx.listener(|this, _, _, cx| {
                                         this.save_api_key(cx);
                                     })),
                             ),
@@ -459,14 +509,3 @@ impl ui::Render for ConfigurationView {
     }
 }
 
-impl ConfigurationView {
-    fn save_api_key(&mut self, cx: &mut Context<Self>) {
-        let api_key = self.api_key.trim().to_string();
-        if !api_key.is_empty() {
-            self.state.update(cx, |state, cx| {
-                state.set_api_key(api_key, cx).detach_and_log_err(cx);
-            });
-            self.api_key.clear();
-        }
-    }
-}
